@@ -34,13 +34,15 @@ func DefaultBrokerConfig() BrokerConfig {
 //   public class Broker {
 //       private Map<String, List<Log>> topics;
 //       private OffsetStore offsets;
+//       private Coordinator coordinator;
 //       private BrokerConfig config;
 //   }
 type Broker struct {
-	topics  map[string][]*Log  // topic name → list of partition Logs
-	offsets *OffsetStore       // persisted consumer group offsets
-	config  BrokerConfig
-	mu      sync.RWMutex       // allows multiple readers OR one writer
+	topics      map[string][]*Log  // topic name → list of partition Logs
+	offsets     *OffsetStore       // persisted consumer group offsets
+	coordinator *Coordinator       // manages consumer groups
+	config      BrokerConfig
+	mu          sync.RWMutex       // allows multiple readers OR one writer
 }
 
 // NewBroker creates a broker with the given config.
