@@ -73,6 +73,7 @@ func runBroker() {
 	// Parse flags for the broker subcommand
 	fs := flag.NewFlagSet("broker", flag.ExitOnError)
 	port := fs.String("port", "9092", "port to listen on")
+	dashPort := fs.String("dash", "8080", "dashboard HTTP port")
 	dataDir := fs.String("data", "data", "directory for log data")
 	fs.Parse(os.Args[2:])
 
@@ -85,8 +86,12 @@ func runBroker() {
 		log.Fatalf("failed to create broker: %v", err)
 	}
 
-	// Create the server
+	// Create the TCP server (for producers/consumers)
 	server := minikafka.NewServer(":"+*port, broker)
+
+	// Start the dashboard (WebSocket + HTTP) in background
+	dashboard := minikafka.NewDashboardServer(broker)
+	go dashboard.Start(":" + *dashPort)
 
 	// Handle Ctrl+C gracefully
 	sigCh := make(chan os.Signal, 1)
@@ -98,7 +103,7 @@ func runBroker() {
 		broker.Close()
 	}()
 
-	// Start (blocks until stopped)
+	// Start TCP server (blocks until stopped)
 	if err := server.Start(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

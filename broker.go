@@ -42,6 +42,7 @@ type Broker struct {
 	topics      map[string][]*Log  // topic name → list of partition Logs
 	offsets     *OffsetStore       // persisted consumer group offsets
 	coordinator *Coordinator       // manages consumer groups
+	Events      *EventBus          // broadcasts events to WebSocket clients
 	config      BrokerConfig
 	mu          sync.RWMutex       // allows multiple readers OR one writer
 }
@@ -59,6 +60,7 @@ func NewBroker(config BrokerConfig) (*Broker, error) {
 		topics:      make(map[string][]*Log),
 		offsets:     offsets,
 		coordinator: NewCoordinator(10 * time.Second), // member dead after 10s no heartbeat
+		Events:      NewEventBus(),
 		config:      config,
 	}
 	return b, nil
@@ -75,12 +77,34 @@ func (b *Broker) JoinGroup(group, memberID, topic string) ([]int, error) {
 		return nil, fmt.Errorf("topic %q does not exist", topic)
 	}
 
-	return b.coordinator.JoinGroup(group, memberID, topic, len(partitions))
+	assignment, err := b.coordinator.JoinGroup(group, memberID, topic, len(partitions))
+	if err != nil {
+		return nil, err
+	}
+
+	b.Events.Emit("join", map[string]interface{}{
+		"group":      group,
+		"member":     memberID,
+		"topic":      topic,
+		"assignment": assignment,
+	})
+
+	return assignment, nil
 }
 
 // LeaveGroup removes a consumer from a group. Triggers rebalance.
 func (b *Broker) LeaveGroup(group, memberID string) error {
-	return b.coordinator.LeaveGroup(group, memberID)
+	err := b.coordinator.LeaveGroup(group, memberID)
+	if err != nil {
+		return err
+	}
+
+	b.Events.Emit("leave", map[string]interface{}{
+		"group":  group,
+		"member": memberID,
+	})
+
+	return nil
 }
 
 // Heartbeat updates a member's liveness. Returns their current partition assignment.
@@ -93,7 +117,16 @@ func (b *Broker) Heartbeat(group, memberID string) ([]int, error) {
 // CommitOffset saves a consumer group's position.
 // "Group X has processed everything before this offset on topic/partition."
 func (b *Broker) CommitOffset(group, topic string, partition int, offset uint64) error {
-	return b.offsets.Commit(group, topic, partition, offset)
+	err := b.offsets.Commit(group, topic, partition, offset)
+	if err == nil {
+		b.Events.Emit("commit", map[string]interface{}{
+			"group":     group,
+			"topic":     topic,
+			"partition": partition,
+			"offset":    offset,
+		})
+	}
+	return err
 }
 
 // FetchOffset returns where a consumer group should resume reading.
@@ -142,6 +175,13 @@ func (b *Broker) CreateTopic(name string, numPartitions int) error {
 	}
 
 	b.topics[name] = partitions
+
+	// Emit event so dashboard can update
+	b.Events.Emit("create_topic", map[string]interface{}{
+		"topic":      name,
+		"partitions": numPartitions,
+	})
+
 	return nil
 }
 
@@ -182,6 +222,14 @@ func (b *Broker) Publish(topic string, key []byte, value []byte) (int, uint64, e
 	if err != nil {
 		return 0, 0, err
 	}
+
+	// Emit event for the dashboard
+	b.Events.Emit("produce", map[string]interface{}{
+		"topic":     topic,
+		"partition": partitionIdx,
+		"offset":    offset,
+		"key":       string(key),
+	})
 
 	return partitionIdx, offset, nil
 }
@@ -288,7 +336,18 @@ func (b *Broker) Consume(topic string, partition int, offset uint64) ([]byte, er
 	}
 
 	// Read from that partition's Log
-	return partitions[partition].Read(offset)
+	data, err := partitions[partition].Read(offset)
+	if err != nil {
+		return nil, err
+	}
+
+	b.Events.Emit("consume", map[string]interface{}{
+		"topic":     topic,
+		"partition": partition,
+		"offset":    offset,
+	})
+
+	return data, nil
 }
 
 // Close closes all partition logs.
