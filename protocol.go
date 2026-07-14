@@ -13,11 +13,15 @@ import (
 // Request types — the first byte of every request body.
 // Java equivalent: public static final int PRODUCE = 1;
 const (
-	RequestProduce     byte = 1
-	RequestConsume     byte = 2
-	RequestCreateTopic byte = 3
-	RequestCommit      byte = 4
-	RequestFetchOffset byte = 5
+	RequestProduce      byte = 1
+	RequestConsume      byte = 2
+	RequestCreateTopic  byte = 3
+	RequestCommit       byte = 4
+	RequestFetchOffset  byte = 5
+	RequestJoinGroup    byte = 6
+	RequestHeartbeat    byte = 7
+	RequestLeaveGroup   byte = 8
+	RequestProduceBatch byte = 9
 )
 
 // Response status codes
@@ -465,6 +469,276 @@ func DecodeFetchOffsetResponse(data []byte) (uint64, error) {
 		return 0, fmt.Errorf("fetch-offset response too short")
 	}
 	return binary.BigEndian.Uint64(data[0:8]), nil
+}
+
+// --- JOIN GROUP ---
+
+// JoinGroupRequest is sent when a consumer starts and wants to join a group.
+// "I'm memberID, I want to read topic as part of group."
+type JoinGroupRequest struct {
+	Group    string
+	MemberID string
+	Topic    string
+}
+
+// EncodeJoinGroupRequest: [type=6][group len][group][memberID len][memberID][topic len][topic]
+func EncodeJoinGroupRequest(req *JoinGroupRequest) []byte {
+	size := 1 + 2 + len(req.Group) + 2 + len(req.MemberID) + 2 + len(req.Topic)
+	buf := make([]byte, 0, size)
+	buf = append(buf, RequestJoinGroup)
+	buf = appendString16(buf, req.Group)
+	buf = appendString16(buf, req.MemberID)
+	buf = appendString16(buf, req.Topic)
+	return buf
+}
+
+func DecodeJoinGroupRequest(data []byte) (*JoinGroupRequest, error) {
+	if len(data) < 1 || data[0] != RequestJoinGroup {
+		return nil, fmt.Errorf("not a join-group request")
+	}
+	pos := 1
+	req := &JoinGroupRequest{}
+
+	group, n, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.Group = group
+	pos += n
+
+	memberID, n, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.MemberID = memberID
+	pos += n
+
+	topic, _, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.Topic = topic
+
+	return req, nil
+}
+
+// EncodeAssignmentResponse encodes a list of partition numbers.
+// Used as the response body for JoinGroup and Heartbeat.
+func EncodeAssignmentResponse(partitions []int) []byte {
+	// Format: [4-byte count][4-byte partition][4-byte partition]...
+	buf := make([]byte, 4+len(partitions)*4)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(partitions)))
+	for i, p := range partitions {
+		binary.BigEndian.PutUint32(buf[4+i*4:4+i*4+4], uint32(p))
+	}
+	return buf
+}
+
+// DecodeAssignmentResponse decodes a list of partition numbers.
+func DecodeAssignmentResponse(data []byte) ([]int, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("assignment response too short")
+	}
+	count := int(binary.BigEndian.Uint32(data[0:4]))
+	if len(data) < 4+count*4 {
+		return nil, fmt.Errorf("assignment response truncated")
+	}
+	partitions := make([]int, count)
+	for i := 0; i < count; i++ {
+		partitions[i] = int(binary.BigEndian.Uint32(data[4+i*4 : 4+i*4+4]))
+	}
+	return partitions, nil
+}
+
+// --- HEARTBEAT ---
+
+// HeartbeatRequest: consumer says "I'm alive" and gets back current assignment.
+type HeartbeatRequest struct {
+	Group    string
+	MemberID string
+}
+
+// EncodeHeartbeatRequest: [type=7][group len][group][memberID len][memberID]
+func EncodeHeartbeatRequest(req *HeartbeatRequest) []byte {
+	size := 1 + 2 + len(req.Group) + 2 + len(req.MemberID)
+	buf := make([]byte, 0, size)
+	buf = append(buf, RequestHeartbeat)
+	buf = appendString16(buf, req.Group)
+	buf = appendString16(buf, req.MemberID)
+	return buf
+}
+
+func DecodeHeartbeatRequest(data []byte) (*HeartbeatRequest, error) {
+	if len(data) < 1 || data[0] != RequestHeartbeat {
+		return nil, fmt.Errorf("not a heartbeat request")
+	}
+	pos := 1
+	req := &HeartbeatRequest{}
+
+	group, n, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.Group = group
+	pos += n
+
+	memberID, _, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.MemberID = memberID
+
+	return req, nil
+}
+
+// --- LEAVE GROUP ---
+
+// LeaveGroupRequest: consumer is shutting down gracefully.
+type LeaveGroupRequest struct {
+	Group    string
+	MemberID string
+}
+
+// EncodeLeaveGroupRequest: [type=8][group len][group][memberID len][memberID]
+func EncodeLeaveGroupRequest(req *LeaveGroupRequest) []byte {
+	size := 1 + 2 + len(req.Group) + 2 + len(req.MemberID)
+	buf := make([]byte, 0, size)
+	buf = append(buf, RequestLeaveGroup)
+	buf = appendString16(buf, req.Group)
+	buf = appendString16(buf, req.MemberID)
+	return buf
+}
+
+func DecodeLeaveGroupRequest(data []byte) (*LeaveGroupRequest, error) {
+	if len(data) < 1 || data[0] != RequestLeaveGroup {
+		return nil, fmt.Errorf("not a leave-group request")
+	}
+	pos := 1
+	req := &LeaveGroupRequest{}
+
+	group, n, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.Group = group
+	pos += n
+
+	memberID, _, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.MemberID = memberID
+
+	return req, nil
+}
+
+// --- PRODUCE BATCH ---
+
+// ProduceBatchRequest sends multiple messages in one network call.
+// Format: [type=9][topic len][topic][4-byte msg count]
+//         then for each message: [2-byte key len][key][4-byte value len][value]
+type ProduceBatchRequest struct {
+	Topic    string
+	Messages []MessageEntry // defined in broker.go
+}
+
+func EncodeProduceBatchRequest(req *ProduceBatchRequest) []byte {
+	// Calculate total size
+	size := 1 + 2 + len(req.Topic) + 4 // type + topic + msg count
+	for _, msg := range req.Messages {
+		size += 2 + len(msg.Key) + 4 + len(msg.Value) // keyLen + key + valueLen + value
+	}
+
+	buf := make([]byte, 0, size)
+	buf = append(buf, RequestProduceBatch)
+	buf = appendString16(buf, req.Topic)
+
+	// Message count (4 bytes)
+	countBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(countBuf, uint32(len(req.Messages)))
+	buf = append(buf, countBuf...)
+
+	// Each message
+	for _, msg := range req.Messages {
+		buf = appendBytes16(buf, msg.Key)
+		buf = appendBytes32(buf, msg.Value)
+	}
+
+	return buf
+}
+
+func DecodeProduceBatchRequest(data []byte) (*ProduceBatchRequest, error) {
+	if len(data) < 1 || data[0] != RequestProduceBatch {
+		return nil, fmt.Errorf("not a produce-batch request")
+	}
+
+	pos := 1
+	req := &ProduceBatchRequest{}
+
+	// Topic
+	topic, n, err := readString16(data, pos)
+	if err != nil {
+		return nil, err
+	}
+	req.Topic = topic
+	pos += n
+
+	// Message count
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("truncated: missing message count")
+	}
+	msgCount := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+
+	// Each message
+	req.Messages = make([]MessageEntry, msgCount)
+	for i := 0; i < msgCount; i++ {
+		key, n, err := readBytes16(data, pos)
+		if err != nil {
+			return nil, fmt.Errorf("message %d key: %w", i, err)
+		}
+		pos += n
+
+		value, n, err := readBytes32(data, pos)
+		if err != nil {
+			return nil, fmt.Errorf("message %d value: %w", i, err)
+		}
+		pos += n
+
+		req.Messages[i] = MessageEntry{Key: key, Value: value}
+	}
+
+	return req, nil
+}
+
+// EncodeBatchProduceResponse encodes results for each message: [count][partition+offset]...
+func EncodeBatchProduceResponse(results []PublishResult) []byte {
+	buf := make([]byte, 4+len(results)*12) // 4 count + 12 per result
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(results)))
+	for i, r := range results {
+		off := 4 + i*12
+		binary.BigEndian.PutUint32(buf[off:off+4], uint32(r.Partition))
+		binary.BigEndian.PutUint64(buf[off+4:off+12], r.Offset)
+	}
+	return buf
+}
+
+// DecodeBatchProduceResponse decodes batch results.
+func DecodeBatchProduceResponse(data []byte) ([]PublishResult, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("batch response too short")
+	}
+	count := int(binary.BigEndian.Uint32(data[0:4]))
+	if len(data) < 4+count*12 {
+		return nil, fmt.Errorf("batch response truncated")
+	}
+	results := make([]PublishResult, count)
+	for i := 0; i < count; i++ {
+		off := 4 + i*12
+		results[i].Partition = int(binary.BigEndian.Uint32(data[off : off+4]))
+		results[i].Offset = binary.BigEndian.Uint64(data[off+4 : off+12])
+	}
+	return results, nil
 }
 
 // === Helper functions for reading/writing variable-length fields ===

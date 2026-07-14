@@ -131,6 +131,71 @@ func (l *Log) Read(offset uint64) ([]byte, error) {
 	return seg.Read(localIndex)
 }
 
+// AppendRecord writes a Record (with CRC, timestamp, key/value) to the active segment.
+func (l *Log) AppendRecord(rec *Record) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	active := l.segments[len(l.segments)-1]
+
+	if active.Size() >= l.config.MaxSegmentBytes {
+		nextBase := active.baseOffset + active.Count()
+		if err := l.newSegment(nextBase); err != nil {
+			return 0, err
+		}
+		active = l.segments[len(l.segments)-1]
+	}
+
+	offset, err := active.AppendRecord(rec)
+	if err != nil {
+		return 0, err
+	}
+
+	l.enforceRetention()
+	return offset, nil
+}
+
+// AppendBatch writes multiple messages with one fsync.
+// If the active segment would overflow, rotates first.
+func (l *Log) AppendBatch(payloads [][]byte) ([]uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	active := l.segments[len(l.segments)-1]
+
+	// If active segment is full, rotate before writing the batch
+	if active.Size() >= l.config.MaxSegmentBytes {
+		nextBase := active.baseOffset + active.Count()
+		if err := l.newSegment(nextBase); err != nil {
+			return nil, err
+		}
+		active = l.segments[len(l.segments)-1]
+	}
+
+	// Write all messages with one fsync
+	offsets, err := active.AppendBatch(payloads)
+	if err != nil {
+		return nil, err
+	}
+
+	l.enforceRetention()
+	return offsets, nil
+}
+
+// ReadRecord reads and decodes a Record at the given offset (with CRC validation).
+func (l *Log) ReadRecord(offset uint64) (*Record, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	seg := l.findSegment(offset)
+	if seg == nil {
+		return nil, fmt.Errorf("offset %d not found (may have been deleted by retention)", offset)
+	}
+
+	localIndex := offset - seg.baseOffset
+	return seg.ReadRecord(localIndex)
+}
+
 // Offset returns the next offset that will be assigned.
 // (i.e., the total number of messages ever written)
 func (l *Log) Offset() uint64 {

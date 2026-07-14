@@ -141,6 +141,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 			response = s.handleCommit(data)
 		case RequestFetchOffset:
 			response = s.handleFetchOffset(data)
+		case RequestJoinGroup:
+			response = s.handleJoinGroup(data)
+		case RequestHeartbeat:
+			response = s.handleHeartbeat(data)
+		case RequestLeaveGroup:
+			response = s.handleLeaveGroup(data)
+		case RequestProduceBatch:
+			response = s.handleProduceBatch(data)
 		default:
 			response = EncodeResponse(StatusError, []byte(fmt.Sprintf("unknown request type: %d", data[0])))
 		}
@@ -235,6 +243,75 @@ func (s *Server) handleFetchOffset(data []byte) []byte {
 	}
 
 	body := EncodeFetchOffsetResponse(offset)
+	return EncodeResponse(StatusOK, body)
+}
+
+// handleJoinGroup processes a join-group request.
+// Consumer says "I'm joining group X to read topic Y."
+// Broker adds them, rebalances, returns their assigned partitions.
+func (s *Server) handleJoinGroup(data []byte) []byte {
+	req, err := DecodeJoinGroupRequest(data)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	partitions, err := s.broker.JoinGroup(req.Group, req.MemberID, req.Topic)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	body := EncodeAssignmentResponse(partitions)
+	return EncodeResponse(StatusOK, body)
+}
+
+// handleHeartbeat processes a heartbeat request.
+// Consumer says "I'm alive." Broker returns their current assignment.
+// If a rebalance happened, the new assignment shows up here.
+func (s *Server) handleHeartbeat(data []byte) []byte {
+	req, err := DecodeHeartbeatRequest(data)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	partitions, err := s.broker.Heartbeat(req.Group, req.MemberID)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	body := EncodeAssignmentResponse(partitions)
+	return EncodeResponse(StatusOK, body)
+}
+
+// handleLeaveGroup processes a leave-group request.
+// Consumer is shutting down gracefully — remove it immediately (don't wait for timeout).
+func (s *Server) handleLeaveGroup(data []byte) []byte {
+	req, err := DecodeLeaveGroupRequest(data)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	err = s.broker.LeaveGroup(req.Group, req.MemberID)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	return EncodeResponse(StatusOK, []byte("left"))
+}
+
+// handleProduceBatch processes a batch produce request.
+// Multiple messages in one network call, one fsync per partition.
+func (s *Server) handleProduceBatch(data []byte) []byte {
+	req, err := DecodeProduceBatchRequest(data)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	results, err := s.broker.PublishBatch(req.Topic, req.Messages)
+	if err != nil {
+		return EncodeResponse(StatusError, []byte(err.Error()))
+	}
+
+	body := EncodeBatchProduceResponse(results)
 	return EncodeResponse(StatusOK, body)
 }
 

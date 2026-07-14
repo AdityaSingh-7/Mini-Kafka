@@ -125,6 +125,69 @@ func (s *Segment) Read(localIndex uint64) ([]byte, error) {
 	return payload, nil
 }
 
+// AppendRecord writes a Record to this segment (new format with CRC + timestamp + key/value).
+// Returns the global offset.
+func (s *Segment) AppendRecord(rec *Record) (uint64, error) {
+	body := EncodeRecord(rec)
+	return s.Append(body)
+}
+
+// ReadRecord reads and decodes a Record at the given local index.
+// Validates the CRC32 checksum — returns error if data is corrupted.
+func (s *Segment) ReadRecord(localIndex uint64) (*Record, error) {
+	body, err := s.Read(localIndex)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeRecord(body) // this validates CRC
+}
+
+// AppendBatch writes multiple messages with ONE fsync at the end.
+// This is the key performance optimization: amortizes the ~4ms fsync cost
+// across all messages in the batch.
+//
+// Returns the global offsets for all messages in order.
+//
+// Comparison:
+//   Single Append (N messages): N writes + N fsyncs = N × 4ms = slow
+//   AppendBatch (N messages):   N writes + 1 fsync  = 1 × 4ms = fast!
+func (s *Segment) AppendBatch(payloads [][]byte) ([]uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	offsets := make([]uint64, len(payloads))
+	pos := s.size
+
+	for i, payload := range payloads {
+		// Record this message's position BEFORE writing
+		offsets[i] = s.baseOffset + uint64(len(s.index))
+
+		// Write size header
+		sizeBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(sizeBuf, uint32(len(payload)))
+		if _, err := s.file.WriteAt(sizeBuf, pos); err != nil {
+			return nil, err
+		}
+
+		// Write payload
+		if _, err := s.file.WriteAt(payload, pos+4); err != nil {
+			return nil, err
+		}
+
+		// Update index (in memory)
+		s.index = append(s.index, pos)
+		pos += 4 + int64(len(payload))
+	}
+
+	// ONE fsync for the entire batch — this is where the speed comes from
+	if err := s.file.Sync(); err != nil {
+		return nil, err
+	}
+
+	s.size = pos
+	return offsets, nil
+}
+
 // Count returns how many messages this segment holds.
 func (s *Segment) Count() uint64 {
 	s.mu.Lock()

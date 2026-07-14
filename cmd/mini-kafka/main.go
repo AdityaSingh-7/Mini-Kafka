@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	minikafka "github.com/AdityaSingh-7/mini-kafka"
 )
@@ -38,10 +39,14 @@ func main() {
 		runProduce()
 	case "consume":
 		runConsume()
+	case "consumer":
+		runConsumer() // long-running poll-based consumer
 	case "commit":
 		runCommit()
 	case "fetch-offset":
 		runFetchOffset()
+	case "bench":
+		runBench()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -56,7 +61,8 @@ Commands:
   broker                       Start the broker server
   create-topic                 Create a new topic
   produce                      Publish a message
-  consume                      Read a message
+  consume                      Read a single message (one-shot)
+  consumer                     Long-running poll-based consumer (joins group, heartbeats, reads)
   commit                       Save consumer group's position
   fetch-offset                 Get consumer group's saved position`)
 }
@@ -351,4 +357,173 @@ func runFetchOffset() {
 	}
 
 	fmt.Printf("%d\n", offset)
+}
+
+// === CONSUMER (long-running poll-based) ===
+//
+// This is how a REAL Kafka consumer works:
+//   1. Join a group → get assigned partitions
+//   2. Fetch committed offsets for each partition (resume where we left off)
+//   3. Loop forever:
+//      a. Heartbeat → check if assignment changed
+//      b. For each assigned partition, read next message
+//      c. Process it (for us: print it)
+//      d. Commit offsets periodically
+//      e. Sleep, repeat
+//   4. On Ctrl+C → send LeaveGroup → broker rebalances immediately
+
+func runConsumer() {
+	fs := flag.NewFlagSet("consumer", flag.ExitOnError)
+	brokerAddr := fs.String("broker", "localhost:9092", "broker address")
+	group := fs.String("group", "", "consumer group name (required)")
+	topic := fs.String("topic", "", "topic name (required)")
+	memberID := fs.String("id", "", "unique consumer ID (auto-generated if empty)")
+	fs.Parse(os.Args[2:])
+
+	if *group == "" || *topic == "" {
+		fmt.Fprintln(os.Stderr, "error: --group and --topic are required")
+		os.Exit(1)
+	}
+
+	// Auto-generate member ID if not provided
+	if *memberID == "" {
+		*memberID = fmt.Sprintf("consumer-%d", time.Now().UnixNano()%100000)
+	}
+
+	// Connect to broker (one persistent connection)
+	conn, err := net.Dial("tcp", *brokerAddr)
+	if err != nil {
+		log.Fatalf("failed to connect to broker at %s: %v", *brokerAddr, err)
+	}
+	defer conn.Close()
+
+	// Step 1: Join the group
+	fmt.Printf("[%s] joining group %q for topic %q...\n", *memberID, *group, *topic)
+	minikafka.WriteFrame(conn, minikafka.EncodeJoinGroupRequest(&minikafka.JoinGroupRequest{
+		Group: *group, MemberID: *memberID, Topic: *topic,
+	}))
+	respData, err := minikafka.ReadFrame(conn)
+	if err != nil {
+		log.Fatalf("join failed: %v", err)
+	}
+	status, body, _ := minikafka.DecodeResponse(respData)
+	if status != minikafka.StatusOK {
+		log.Fatalf("join rejected: %s", string(body))
+	}
+	assignment, _ := minikafka.DecodeAssignmentResponse(body)
+	fmt.Printf("[%s] assigned partitions: %v\n", *memberID, assignment)
+
+	// Step 2: Fetch committed offsets for each assigned partition
+	offsets := make(map[int]uint64) // partition → next offset to read
+	for _, p := range assignment {
+		minikafka.WriteFrame(conn, minikafka.EncodeFetchOffsetRequest(&minikafka.FetchOffsetRequest{
+			Group: *group, Topic: *topic, Partition: p,
+		}))
+		respData, _ := minikafka.ReadFrame(conn)
+		_, body, _ := minikafka.DecodeResponse(respData)
+		off, _ := minikafka.DecodeFetchOffsetResponse(body)
+		offsets[p] = off
+	}
+	fmt.Printf("[%s] starting offsets: %v\n", *memberID, offsets)
+
+	// Handle Ctrl+C: send LeaveGroup for clean shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Printf("\n[%s] shutting down, leaving group...\n", *memberID)
+		minikafka.WriteFrame(conn, minikafka.EncodeLeaveGroupRequest(&minikafka.LeaveGroupRequest{
+			Group: *group, MemberID: *memberID,
+		}))
+		minikafka.ReadFrame(conn) // consume response
+		conn.Close()
+		os.Exit(0)
+	}()
+
+	// Step 3: Poll loop — runs forever
+	commitInterval := 10 // commit every 10 iterations
+	iteration := 0
+
+	for {
+		// 3a. Heartbeat — tells broker "I'm alive" and gets current assignment
+		minikafka.WriteFrame(conn, minikafka.EncodeHeartbeatRequest(&minikafka.HeartbeatRequest{
+			Group: *group, MemberID: *memberID,
+		}))
+		respData, err := minikafka.ReadFrame(conn)
+		if err != nil {
+			log.Fatalf("heartbeat failed (broker down?): %v", err)
+		}
+		status, body, _ := minikafka.DecodeResponse(respData)
+		if status != minikafka.StatusOK {
+			log.Fatalf("heartbeat rejected: %s", string(body))
+		}
+		newAssignment, _ := minikafka.DecodeAssignmentResponse(body)
+
+		// Check if assignment changed (rebalance happened)
+		if !sameAssignment(assignment, newAssignment) {
+			fmt.Printf("[%s] REBALANCE! new assignment: %v (was %v)\n", *memberID, newAssignment, assignment)
+			assignment = newAssignment
+			// Fetch offsets for any NEW partitions
+			for _, p := range assignment {
+				if _, exists := offsets[p]; !exists {
+					minikafka.WriteFrame(conn, minikafka.EncodeFetchOffsetRequest(&minikafka.FetchOffsetRequest{
+						Group: *group, Topic: *topic, Partition: p,
+					}))
+					respData, _ := minikafka.ReadFrame(conn)
+					_, body, _ := minikafka.DecodeResponse(respData)
+					off, _ := minikafka.DecodeFetchOffsetResponse(body)
+					offsets[p] = off
+					fmt.Printf("[%s] new partition %d, starting at offset %d\n", *memberID, p, off)
+				}
+			}
+		}
+
+		// 3b. Read next message from each assigned partition
+		for _, p := range assignment {
+			offset := offsets[p]
+			minikafka.WriteFrame(conn, minikafka.EncodeConsumeRequest(&minikafka.ConsumeRequest{
+				Topic: *topic, Partition: p, Offset: offset,
+			}))
+			respData, _ := minikafka.ReadFrame(conn)
+			status, body, _ := minikafka.DecodeResponse(respData)
+
+			if status == minikafka.StatusOK {
+				// 3c. "Process" the message (print it)
+				fmt.Printf("[%s] partition=%d offset=%d: %s\n", *memberID, p, offset, string(body))
+				offsets[p] = offset + 1 // advance to next
+			}
+			// If status != OK, partition is caught up (no new messages). That's fine.
+		}
+
+		// 3d. Commit offsets periodically
+		iteration++
+		if iteration%commitInterval == 0 {
+			for _, p := range assignment {
+				minikafka.WriteFrame(conn, minikafka.EncodeCommitRequest(&minikafka.CommitRequest{
+					Group: *group, Topic: *topic, Partition: p, Offset: offsets[p],
+				}))
+				minikafka.ReadFrame(conn) // consume ack
+			}
+		}
+
+		// 3e. Sleep before next poll
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// sameAssignment checks if two partition assignments are equal.
+func sameAssignment(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	setA := make(map[int]bool)
+	for _, v := range a {
+		setA[v] = true
+	}
+	for _, v := range b {
+		if !setA[v] {
+			return false
+		}
+	}
+	return true
 }

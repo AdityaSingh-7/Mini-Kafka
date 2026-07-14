@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // BrokerConfig holds settings for the broker.
@@ -55,11 +56,38 @@ func NewBroker(config BrokerConfig) (*Broker, error) {
 	}
 
 	b := &Broker{
-		topics:  make(map[string][]*Log),
-		offsets: offsets,
-		config:  config,
+		topics:      make(map[string][]*Log),
+		offsets:     offsets,
+		coordinator: NewCoordinator(10 * time.Second), // member dead after 10s no heartbeat
+		config:      config,
 	}
 	return b, nil
+}
+
+// JoinGroup adds a consumer to a group and returns its partition assignment.
+// This is called when a consumer starts and says "I want to be in group X, reading topic Y."
+func (b *Broker) JoinGroup(group, memberID, topic string) ([]int, error) {
+	b.mu.RLock()
+	partitions, exists := b.topics[topic]
+	b.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("topic %q does not exist", topic)
+	}
+
+	return b.coordinator.JoinGroup(group, memberID, topic, len(partitions))
+}
+
+// LeaveGroup removes a consumer from a group. Triggers rebalance.
+func (b *Broker) LeaveGroup(group, memberID string) error {
+	return b.coordinator.LeaveGroup(group, memberID)
+}
+
+// Heartbeat updates a member's liveness. Returns their current partition assignment.
+// If a rebalance happened, the new assignment is returned here — that's how
+// the consumer LEARNS about rebalances.
+func (b *Broker) Heartbeat(group, memberID string) ([]int, error) {
+	return b.coordinator.Heartbeat(group, memberID)
 }
 
 // CommitOffset saves a consumer group's position.
@@ -156,6 +184,89 @@ func (b *Broker) Publish(topic string, key []byte, value []byte) (int, uint64, e
 	}
 
 	return partitionIdx, offset, nil
+}
+
+// MessageEntry is one message in a batch (key + value).
+type MessageEntry struct {
+	Key   []byte
+	Value []byte
+}
+
+// PublishResult is the result for one message in a batch.
+type PublishResult struct {
+	Partition int
+	Offset    uint64
+}
+
+// PublishBatch writes multiple messages to a topic with ONE fsync per partition.
+// Messages are grouped by partition (based on key hash), then each group is
+// written in a single batch to that partition's log.
+//
+// This is the key performance API:
+//   Single Publish × 1000: 1000 fsyncs = ~4 seconds
+//   PublishBatch(1000):     N fsyncs (one per partition hit) = ~4ms × N partitions
+func (b *Broker) PublishBatch(topic string, messages []MessageEntry) ([]PublishResult, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	partitions, exists := b.topics[topic]
+	if !exists {
+		return nil, fmt.Errorf("topic %q does not exist", topic)
+	}
+
+	numPartitions := len(partitions)
+
+	// Group messages by partition
+	// Java: Map<Integer, List<byte[]>> groups = new HashMap<>();
+	type indexedPayload struct {
+		originalIdx int    // position in the input slice (for building results)
+		payload     []byte // the value to write
+	}
+	groups := make(map[int][]indexedPayload)
+
+	for i, msg := range messages {
+		var pIdx int
+		if len(msg.Key) > 0 {
+			pIdx = hashKey(msg.Key, numPartitions)
+		} else {
+			total := uint64(0)
+			for _, p := range partitions {
+				total += p.Offset()
+			}
+			pIdx = int((total + uint64(i)) % uint64(numPartitions))
+		}
+		groups[pIdx] = append(groups[pIdx], indexedPayload{
+			originalIdx: i,
+			payload:     msg.Value,
+		})
+	}
+
+	// Write each group as a batch (one fsync per partition)
+	results := make([]PublishResult, len(messages))
+
+	for pIdx, items := range groups {
+		// Collect payloads for this partition
+		payloads := make([][]byte, len(items))
+		for i, item := range items {
+			payloads[i] = item.payload
+		}
+
+		// Batch write — ONE fsync for all messages in this partition
+		offsets, err := partitions[pIdx].AppendBatch(payloads)
+		if err != nil {
+			return nil, fmt.Errorf("batch write to partition %d failed: %w", pIdx, err)
+		}
+
+		// Fill in results at the correct positions
+		for i, item := range items {
+			results[item.originalIdx] = PublishResult{
+				Partition: pIdx,
+				Offset:    offsets[i],
+			}
+		}
+	}
+
+	return results, nil
 }
 
 // Consume reads a message from a specific topic/partition/offset.
